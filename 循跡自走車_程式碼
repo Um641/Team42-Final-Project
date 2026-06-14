@@ -1,0 +1,238 @@
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled!
+#endif
+
+BluetoothSerial SerialBT;
+bool bt_success = false; // 紀錄藍牙狀態
+
+// ==============================================================================
+// BLOCK 1: 硬體腳位與配置定義 (HARDWARE DEFINITIONS)
+// ==============================================================================
+const int pins_sensor[5] = {13, 33, 14, 27, 26};
+
+const int pin_IN1 = 18; const int pin_IN2 = 19;
+const int pin_IN3 = 23; const int pin_IN4 = 17;
+const int pin_ENA = 21; const int pin_ENB = 16;
+
+const int pwmFreq = 1000;
+const int pwmResolution = 10;
+
+const int pin_LED_R = 5;
+const int pin_LED_G = 4;
+const int pin_LED_B = 22;
+
+const int pin_VLS = 25;
+const int pin_EBS = 32;
+
+// ==============================================================================
+// BLOCK 2: 演算法參數與控制變數
+// ==============================================================================
+// 🌟 強化過彎能力：加大轉向靈敏度，並讓車子入彎時懂得減速
+// ==============================================================================
+// BLOCK 2: 演算法參數與控制變數 (極限甩尾版)
+// ==============================================================================
+float KP = 550.0;              // 🚀 【暴力拉高】原本 350，直接逼近 600。極大化左右輪速差！
+float KD = 150.0;              // 🛡️ 【阻尼提升】配合 KP 拉高，KD 也要跟著拉，防止直線時瘋狂搖晃
+float current_error = 0.0;
+float last_error = 0.0;
+
+int MAX_BASE_SPEED = 600;      // 🛑 【暫時封印極速】原本 850 慣性太大絕對推頭，先降到 600 求過彎，穩了再往上加！
+int MIN_BASE_SPEED = 150;      // 📉 【入彎極速降低】原本 250，降到 150，讓過彎時幾乎變成「原地旋轉」
+int ACCEL_RATE = 15;
+int DECEL_RATE = 120;          // 🛑 【煞車踩死】原本 80，現在只要一看到彎道，瞬間把速度壓回 150
+int current_base_speed = MIN_BASE_SPEED;
+int MOTOR_MIN_PWM = 120;       // ⚙️ 【解鎖微調能力】原本 250 限制太死，L298N 只要給 120 就足以克服靜摩擦力了
+
+int CROSSROAD_STRATEGY = 1;
+bool USE_ELECTRONIC_BRAKE = false;
+
+volatile bool ebs_triggered = false;
+unsigned long oc_start_time = 0;
+
+// ==============================================================================
+// BLOCK 3: 硬體中斷服務常式
+// ==============================================================================
+void IRAM_ATTR ebs_interrupt_handler() {
+  static unsigned long last_interrupt_time = 0;
+  unsigned long interrupt_time = millis();
+  if (interrupt_time - last_interrupt_time > 50) {
+    int confirm_count = 0;
+    for(int i = 0; i < 5; i++) {
+      if(digitalRead(pin_EBS) == LOW) confirm_count++;
+    }
+    if(confirm_count >= 3) ebs_triggered = true;
+  }
+  last_interrupt_time = interrupt_time;
+}
+
+// ==============================================================================
+// BLOCK 4: ASL 指示燈控制模組
+// ==============================================================================
+void set_asl_mode(String mode) {
+  digitalWrite(pin_LED_R, LOW);
+  digitalWrite(pin_LED_G, LOW);
+  digitalWrite(pin_LED_B, LOW);
+  if (mode == "SAFE")           digitalWrite(pin_LED_G, HIGH);
+  else if (mode == "READY")     digitalWrite(pin_LED_B, HIGH);
+  else if (mode == "NAVIGATING") digitalWrite(pin_LED_R, HIGH);
+}
+
+// ==============================================================================
+// BLOCK 5: 馬達驅動控制
+// ==============================================================================
+void brake_all_motors() {
+  digitalWrite(pin_IN1, HIGH); digitalWrite(pin_IN2, HIGH);
+  ledcWrite(pin_ENA, 1023);
+  digitalWrite(pin_IN3, HIGH); digitalWrite(pin_IN4, HIGH);
+  ledcWrite(pin_ENB, 1023);
+}
+
+void control_motor_left(float speed) {
+  if (speed > 0) {
+    digitalWrite(pin_IN1, LOW); digitalWrite(pin_IN2, HIGH);
+    ledcWrite(pin_ENA, max((int)speed, MOTOR_MIN_PWM));
+  } else if (speed < 0) {
+    digitalWrite(pin_IN1, HIGH); digitalWrite(pin_IN2, LOW);
+    ledcWrite(pin_ENA, max((int)abs(speed), MOTOR_MIN_PWM));
+  } else {
+    digitalWrite(pin_IN1, LOW); digitalWrite(pin_IN2, LOW); ledcWrite(pin_ENA, 0);
+  }
+}
+
+void control_motor_right(float speed) {
+  if (speed > 0) {
+    digitalWrite(pin_IN3, LOW); digitalWrite(pin_IN4, HIGH);
+    ledcWrite(pin_ENB, max((int)speed, MOTOR_MIN_PWM));
+  } else if (speed < 0) {
+    digitalWrite(pin_IN3, HIGH); digitalWrite(pin_IN4, LOW);
+    ledcWrite(pin_ENB, max((int)abs(speed), MOTOR_MIN_PWM));
+  } else {
+    digitalWrite(pin_IN3, LOW); digitalWrite(pin_IN4, LOW); ledcWrite(pin_ENB, 0);
+  }
+}
+
+// ==============================================================================
+// BLOCK 6: 系統初始化 (SYSTEM SETUP)
+// ==============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("========================================");
+  Serial.print("🧠 系統初始化，當前剩餘記憶體(Heap): ");
+  Serial.println(ESP.getFreeHeap());
+
+  SerialBT.end();
+  delay(200);
+
+  bt_success = SerialBT.begin("NCKU_YX_CAR");
+  if (!bt_success) {
+    Serial.println("❌ 藍牙記憶體分配失敗！");
+  } else {
+    Serial.println("⚙️ 藍牙強行重置成功！廣播名稱：'NCKU_YX_CAR'");
+  }
+
+  for(int i = 0; i < 5; i++) pinMode(pins_sensor[i], INPUT_PULLDOWN);
+  pinMode(pin_IN1, OUTPUT);   pinMode(pin_IN2, OUTPUT);
+  pinMode(pin_IN3, OUTPUT);   pinMode(pin_IN4, OUTPUT);
+  pinMode(pin_LED_R, OUTPUT); pinMode(pin_LED_G, OUTPUT); pinMode(pin_LED_B, OUTPUT);
+  pinMode(pin_VLS, INPUT_PULLUP);
+  pinMode(pin_EBS, INPUT_PULLUP);
+
+  ledcAttach(pin_ENA, pwmFreq, pwmResolution);
+  ledcAttach(pin_ENB, pwmFreq, pwmResolution);
+  attachInterrupt(digitalPinToInterrupt(pin_EBS), ebs_interrupt_handler, FALLING);
+
+  set_asl_mode("SAFE");
+  brake_all_motors();
+  delay(1000);
+
+  set_asl_mode("READY");
+  Serial.println("🔵 狀態：READY。藍燈恆亮，等待藍牙指令 'V'...");
+
+  while (true) {
+    if (SerialBT.available()) {
+      char cmd = SerialBT.read();
+      if (cmd == 'V' || cmd == 'v') {
+        Serial.println("📱 藍牙起跑成功！");
+        // 手機 APP 會收到這兩行中文
+        SerialBT.println("✅ 已收到起跑指令！");
+        SerialBT.println("🚀 3 秒後出發！");
+        break;
+      }
+    }
+    if (ebs_triggered) break;
+    brake_all_motors();
+    delay(20);
+  }
+
+  if (!ebs_triggered) {
+    Serial.println("🚀 執行 3 秒起跑延遲...");
+    delay(3000);
+  }
+  set_asl_mode("NAVIGATING");
+}
+
+// ==============================================================================
+// BLOCK 7: 自主導航核心主迴圈
+// ==============================================================================
+void loop() {
+  if (bt_success && SerialBT.available()) {
+    char cmd = SerialBT.read();
+    if (cmd == 'E' || cmd == 'e') {
+      ebs_triggered = true;
+      Serial.println("🚨 收到遠端 EBS 指令！");
+      SerialBT.println("🚨 【緊急煞車】馬達已死鎖！");
+    }
+  }
+
+  if (ebs_triggered) {
+    brake_all_motors();
+    set_asl_mode("SAFE");
+    while (true) { brake_all_motors(); delay(1000); }
+  }
+
+int s[5]; int active_sensors = 0;
+  for (int i = 0; i < 5; i++) {
+    // 🌟 關鍵修正：當讀取到 LOW (黑線) 時，我們給它數值 1 (代表有偵測到目標)
+    // 如果讀取到 HIGH (白底)，給它數值 0
+    s[i] = (digitalRead(pins_sensor[i]) == LOW) ? 1 : 0;
+
+    active_sensors += s[i]; // 現在這裡計算的是「有幾個感測器壓在黑線上」！
+  }
+
+  if (active_sensors >= 4) {
+    if (CROSSROAD_STRATEGY == 0) { ebs_triggered = true; return; }
+    else { current_error = 0.0; oc_start_time = 0; }
+  }
+  else if (active_sensors > 0) {
+    // 🌟 【修正】對調權重正負號，解決「左邊看到線卻往右轉」的邏輯相反問題！
+    float weighted_sum = (s[0] * 2.0) + (s[1] * 1.0) + (s[2] * 0.0) + (s[3] * -1.0) + (s[4] * -2.0);
+    current_error = weighted_sum / active_sensors;
+    oc_start_time = 0;
+  }
+  else {
+    if (oc_start_time == 0) oc_start_time = millis();
+    else if (millis() - oc_start_time > 5000) { ebs_triggered = true; return; }
+    if (last_error < 0) current_error = -2.5;
+    else if (last_error > 0) current_error = 2.5;
+  }
+
+  if (abs(current_error) <= 0.5) current_base_speed = min(current_base_speed + ACCEL_RATE, MAX_BASE_SPEED);
+  else current_base_speed = max(current_base_speed - DECEL_RATE, MIN_BASE_SPEED);
+
+  float P = current_error;
+  float D = current_error - last_error;
+  float motor_delta = (KP * P) + (KD * D);
+  last_error = current_error;
+
+  float left_speed = max(min(current_base_speed - motor_delta, 1023.0f), -1023.0f);
+  float right_speed = max(min(current_base_speed + motor_delta, 1023.0f), -1023.0f);
+
+  control_motor_left(left_speed);
+  control_motor_right(right_speed);
+  delay(5);
+}
