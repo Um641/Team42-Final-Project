@@ -30,17 +30,20 @@ const int pin_EBS = 32;
 // ==============================================================================
 // BLOCK 2: 演算法參數與控制變數 (極限甩尾版)
 // ==============================================================================
-float KP = 550.0;              // 🚀 【暴力拉高】原本 350，直接逼近 600。極大化左右輪速差！
-float KD = 150.0;              // 🛡️ 【阻尼提升】配合 KP 拉高，KD 也要跟著拉，防止直線時瘋狂搖晃
+float KP = 450.0;              // 稍降 KP，配合新版邏輯防止過度打滑
+float KD = 180.0;              // 稍微拉高 KD 阻尼
 float current_error = 0.0;
 float last_error = 0.0;
 
-int MAX_BASE_SPEED = 600;      // 🛑 【暫時封印極速】原本 850 慣性太大絕對推頭，先降到 600 求過彎，穩了再往上加！
-int MIN_BASE_SPEED = 150;      // 📉 【入彎極速降低】原本 250，降到 150，讓過彎時幾乎變成「原地旋轉」
+int MAX_BASE_SPEED = 600;      
+int MIN_BASE_SPEED = 150;      
 int ACCEL_RATE = 15;
-int DECEL_RATE = 120;          // 🛑 【煞車踩死】原本 80，現在只要一看到彎道，瞬間把速度壓回 150
+int DECEL_RATE = 120;          
 int current_base_speed = MIN_BASE_SPEED;
-int MOTOR_MIN_PWM = 120;       // ⚙️ 【解鎖微調能力】原本 250 限制太死，L298N 只要給 120 就足以克服靜摩擦力了
+int MOTOR_MIN_PWM = 120;       
+
+// 🌟【新增：長期記憶變數】解決你的編譯錯誤就是少宣告了這個！
+int history_direction = 1;     // 1 代表左轉，-1 代表右轉
 
 bool USE_ELECTRONIC_BRAKE = false;
 
@@ -137,17 +140,8 @@ void setup() {
   pinMode(pin_VLS, INPUT_PULLUP);
   pinMode(pin_EBS, INPUT_PULLUP);
 
-// ⚙️ 左輪速度控制配置：將左輪啟動腳位 (pin_ENA) 綁定至 ESP32 的 LEDC (PWM) 硬體模組
-  // 設定 PWM 頻率為 1000 Hz，解析度為 10 位元（馬達速度控制範圍可從 0 到 1023）
   ledcAttach(pin_ENA, pwmFreq, pwmResolution);
-
-  // ⚙️ 右輪速度控制配置：將右輪啟動腳位 (pin_ENB) 綁定至 ESP32 的 LEDC (PWM) 硬體模組
-  // 參數與左輪相同，確保兩輪速度控制硬體基準點一致
   ledcAttach(pin_ENB, pwmFreq, pwmResolution);
-
-  // 🚨 全車安全核心中斷：將緊急煞車腳位 (pin_EBS) 轉換為中斷通道，並綁定專屬的處理函式
-  // 觸發條件設定為 FALLING（下降沿觸發，即電位從原本上拉的 HIGH 變為接地的 LOW 的瞬間）
-  // 只要訊號一跳變，CPU 會強制暫停 loop() 的 PID 計算，以零延遲的最高優先權跳去執行 ebs_interrupt_handler()
   attachInterrupt(digitalPinToInterrupt(pin_EBS), ebs_interrupt_handler, FALLING);
 
   set_asl_mode("SAFE");
@@ -180,7 +174,7 @@ void setup() {
 }
 
 // ==============================================================================
-// BLOCK 7: 自主導航核心主迴圈（修正左轉直角推頭版）
+// BLOCK 7: 自主導航核心主迴圈 (V14 記憶防甩尾版 + 藍牙回傳)
 // ==============================================================================
 void loop() {
   if (bt_success && SerialBT.available()) {
@@ -204,51 +198,33 @@ void loop() {
     active_sensors += s[i];
   }
 
-  // 🌟【新增：左轉直角特判攔截器】🌟
-  // 當最左邊(s[0])與中間(s[2])同時看到黑線，代表衝進左直角了！
-  if (s[0] == 1 && s[2] == 1) {
-    // 1. 先踩死煞車 15 毫秒，利用 L298N 物理反轉消減長直線衝刺的恐怖慣性
-    control_motor_left(-400);
-    control_motor_right(-400);
-    delay(15);
+  // 🌟【V14 核心】：只記憶最外側的極端轉彎方向，無視直線的微小震盪
+  if (s[0] == 1) history_direction = 1;       
+  else if (s[4] == 1) history_direction = -1; 
 
-    // 2. 強制執行「原地左自轉」修正
-    // 左輪後退，右輪前進，轉向速度給 350-450 即可，太高會再次甩尾過頭
-    control_motor_left(-350);
-    control_motor_right(450);
-
-    // 🌟【關鍵修正】：強制盲轉 100 毫秒，確保 s[2] 確實離開當前的黑線進入白底
-    delay(100);
-
-    // 3. 用死迴圈鎖定，直到「中央感測器(s[2])」再次重新咬住黑線，才跳出交回給 PD
-    long safety_timeout = millis();
-    while (digitalRead(pins_sensor[2]) == HIGH) {
-      // 安全機制：如果轉超過 800 毫秒都沒看到線，強制觸發 EBS 停車，防止無限制亂轉
-      if (millis() - safety_timeout > 800) {
-        ebs_triggered = true;
-        return;
-      }
-      delay(1);
-    }
-
-    // 重新校正誤差值，防止跳出 while 後 PD 產生瞬間劇烈大跳躍
-    current_error = 0.0;
-    last_error = 0.0;
-    current_base_speed = MIN_BASE_SPEED; // 將速度降回低點重新出發
-    return; // 結束這一輪 loop，直接進下一輪
-  }
-
-  // --- 以下維持你原本寫得很好的 PD 演算法邏輯 ---
   if (active_sensors > 0) {
-    float weighted_sum = (s[0] * 2.0) + (s[1] * 1.0) + (s[2] * 0.0) + (s[3] * -1.0) + (s[4] * -2.0);
-    current_error = weighted_sum / active_sensors;
+    // 🌟【V14 急彎特判】：給予極大誤差值並強力降速，不使用 delay 卡死
+    if (s[0] == 1 && s[1] == 1) { 
+      current_error = 3.0; 
+      current_base_speed = MIN_BASE_SPEED - 30; 
+    } 
+    else if (s[4] == 1 && s[3] == 1) {
+      current_error = -3.0; 
+      current_base_speed = MIN_BASE_SPEED - 30;
+    } 
+    else {
+      float weighted_sum = (s[0] * 2.0) + (s[1] * 1.0) + (s[2] * 0.0) + (s[3] * -1.0) + (s[4] * -2.0);
+      current_error = weighted_sum / active_sensors;
+    }
     oc_start_time = 0;
   }
   else {
     if (oc_start_time == 0) oc_start_time = millis();
-    else if (millis() - oc_start_time > 5000) { ebs_triggered = true; return; }
-    if (last_error < 0) current_error = -2.5;
-    else if (last_error > 0) current_error = 2.5;
+    else if (millis() - oc_start_time > 3000) { ebs_triggered = true; return; } 
+    
+    // 🌟【V14 飛線救援】：全白飛線時，絕對依照長期記憶強迫轉向！
+    current_error = (history_direction == 1) ? 3.0 : -3.0;
+    current_base_speed = MIN_BASE_SPEED - 30; 
   }
 
   if (abs(current_error) <= 0.5) current_base_speed = min(current_base_speed + ACCEL_RATE, MAX_BASE_SPEED);
@@ -256,7 +232,7 @@ void loop() {
 
   float P = current_error;
   float D = current_error - last_error;
-  float motor_delta = (KP * P) + (KD * D);
+  float motor_delta = (KP * P) + (KD * D); 
   last_error = current_error;
 
   float left_speed = max(min(current_base_speed - motor_delta, 1023.0f), -1023.0f);
@@ -264,5 +240,22 @@ void loop() {
 
   control_motor_left(left_speed);
   control_motor_right(right_speed);
+
+  // ==========================================================
+  // 🌟【新增：藍牙非阻塞狀態回傳系統】🌟
+  // ==========================================================
+  static unsigned long last_bt_send_time = 0; 
+
+  if (millis() - last_bt_send_time > 200) {
+    if (bt_success && SerialBT.hasClient()) { 
+      String current_dir = "未知";
+      if (history_direction == 1) current_dir = "⬅️ 左轉記憶";
+      else if (history_direction == -1) current_dir = "➡️ 右轉記憶";
+
+      String debug_msg = "方向: " + current_dir + " | 誤差: " + String(current_error) + " | 速度: " + String(current_base_speed);
+      SerialBT.println(debug_msg);
+    }
+    last_bt_send_time = millis(); 
+  }
   delay(5);
 }
