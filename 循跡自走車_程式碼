@@ -137,8 +137,17 @@ void setup() {
   pinMode(pin_VLS, INPUT_PULLUP);
   pinMode(pin_EBS, INPUT_PULLUP);
 
+// ⚙️ 左輪速度控制配置：將左輪啟動腳位 (pin_ENA) 綁定至 ESP32 的 LEDC (PWM) 硬體模組
+  // 設定 PWM 頻率為 1000 Hz，解析度為 10 位元（馬達速度控制範圍可從 0 到 1023）
   ledcAttach(pin_ENA, pwmFreq, pwmResolution);
+
+  // ⚙️ 右輪速度控制配置：將右輪啟動腳位 (pin_ENB) 綁定至 ESP32 的 LEDC (PWM) 硬體模組
+  // 參數與左輪相同，確保兩輪速度控制硬體基準點一致
   ledcAttach(pin_ENB, pwmFreq, pwmResolution);
+
+  // 🚨 全車安全核心中斷：將緊急煞車腳位 (pin_EBS) 轉換為中斷通道，並綁定專屬的處理函式
+  // 觸發條件設定為 FALLING（下降沿觸發，即電位從原本上拉的 HIGH 變為接地的 LOW 的瞬間）
+  // 只要訊號一跳變，CPU 會強制暫停 loop() 的 PID 計算，以零延遲的最高優先權跳去執行 ebs_interrupt_handler()
   attachInterrupt(digitalPinToInterrupt(pin_EBS), ebs_interrupt_handler, FALLING);
 
   set_asl_mode("SAFE");
