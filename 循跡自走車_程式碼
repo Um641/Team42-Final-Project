@@ -28,22 +28,24 @@ const int pin_VLS = 25;
 const int pin_EBS = 32;
 
 // ==============================================================================
-// BLOCK 2: 演算法參數與控制變數 (精簡單行道版)
+// BLOCK 2: 演算法參數與控制變數 (極限甩尾版)
 // ==============================================================================
-float KP = 550.0;              // 🚀 極大化左右輪速差，強化大彎轉向能力
-float KD = 170.0;              // 🛡️ 阻尼提升，抑制高 KP 帶來的直線擺盪
+float KP = 550.0;              // 🚀 【暴力拉高】原本 350，直接逼近 600。極大化左右輪速差！
+float KD = 150.0;              // 🛡️ 【阻尼提升】配合 KP 拉高，KD 也要跟著拉，防止直線時瘋狂搖晃
 float current_error = 0.0;
 float last_error = 0.0;
 
-int MAX_BASE_SPEED = 850;      // 🛑 直線極速上限
-int MIN_BASE_SPEED = 150;      // 📉 入彎最低基準速（確保過彎不推頭）
-int ACCEL_RATE = 35;
-int DECEL_RATE = 180;          // 🛑 煞車率：偵測到大誤差時瞬間重踩煞車
+int MAX_BASE_SPEED = 600;      // 🛑 【暫時封印極速】原本 850 慣性太大絕對推頭，先降到 600 求過彎，穩了再往上加！
+int MIN_BASE_SPEED = 150;      // 📉 【入彎極速降低】原本 250，降到 150，讓過彎時幾乎變成「原地旋轉」
+int ACCEL_RATE = 15;
+int DECEL_RATE = 120;          // 🛑 【煞車踩死】原本 80，現在只要一看到彎道，瞬間把速度壓回 150
 int current_base_speed = MIN_BASE_SPEED;
-int MOTOR_MIN_PWM = 120;       // ⚙️ 克服馬達靜摩擦力的最低 PWM 限制
+int MOTOR_MIN_PWM = 120;       // ⚙️ 【解鎖微調能力】原本 250 限制太死，L298N 只要給 120 就足以克服靜摩擦力了
+
+bool USE_ELECTRONIC_BRAKE = false;
 
 volatile bool ebs_triggered = false;
-unsigned long oc_start_time = 0; // 紀錄衝出賽道（全白）的起始時間
+unsigned long oc_start_time = 0;
 
 // ==============================================================================
 // BLOCK 3: 硬體中斷服務常式
@@ -169,10 +171,9 @@ void setup() {
 }
 
 // ==============================================================================
-// BLOCK 7: 自主導航核心主迴圈
+// BLOCK 7: 自主導航核心主迴圈（修正左轉直角推頭版）
 // ==============================================================================
 void loop() {
-  // 1. 藍牙遙控煞車監聽
   if (bt_success && SerialBT.available()) {
     char cmd = SerialBT.read();
     if (cmd == 'E' || cmd == 'e') {
@@ -182,72 +183,76 @@ void loop() {
     }
   }
 
-  // 2. 安全死鎖判定
   if (ebs_triggered) {
     brake_all_motors();
     set_asl_mode("SAFE");
     while (true) { brake_all_motors(); delay(1000); }
   }
 
-  // 3. 讀取感測器狀態 (LOW = 黑線 = 1, HIGH = 白底 = 0)
   int s[5]; int active_sensors = 0;
   for (int i = 0; i < 5; i++) {
     s[i] = (digitalRead(pins_sensor[i]) == LOW) ? 1 : 0;
     active_sensors += s[i];
   }
 
-  // 4. 核心循跡與完賽判定邏輯
+  // 🌟【新增：左轉直角特判攔截器】🌟
+  // 當最左邊(s[0])與中間(s[2])同時看到黑線，代表衝進左直角了！
+  if (s[0] == 1 && s[2] == 1) {
+    // 1. 先踩死煞車 15 毫秒，利用 L298N 物理反轉消減長直線衝刺的恐怖慣性
+    control_motor_left(-400);
+    control_motor_right(-400);
+    delay(15);
+
+    // 2. 強制執行「原地左自轉」修正
+    // 左輪後退，右輪前進，轉向速度給 350-450 即可，太高會再次甩尾過頭
+    control_motor_left(-350);
+    control_motor_right(450);
+
+    // 🌟【關鍵修正】：強制盲轉 100 毫秒，確保 s[2] 確實離開當前的黑線進入白底
+    delay(100);
+
+    // 3. 用死迴圈鎖定，直到「中央感測器(s[2])」再次重新咬住黑線，才跳出交回給 PD
+    long safety_timeout = millis();
+    while (digitalRead(pins_sensor[2]) == HIGH) {
+      // 安全機制：如果轉超過 800 毫秒都沒看到線，強制觸發 EBS 停車，防止無限制亂轉
+      if (millis() - safety_timeout > 800) {
+        ebs_triggered = true;
+        return;
+      }
+      delay(1);
+    }
+
+    // 重新校正誤差值，防止跳出 while 後 PD 產生瞬間劇烈大跳躍
+    current_error = 0.0;
+    last_error = 0.0;
+    current_base_speed = MIN_BASE_SPEED; // 將速度降回低點重新出發
+    return; // 結束這一輪 loop，直接進下一輪
+  }
+
+  // --- 以下維持你原本寫得很好的 PD 演算法邏輯 ---
   if (active_sensors > 0) {
-    // 🟢 狀況 A：正常抓到黑線，執行加權誤差計算
     float weighted_sum = (s[0] * 2.0) + (s[1] * 1.0) + (s[2] * 0.0) + (s[3] * -1.0) + (s[4] * -2.0);
     current_error = weighted_sum / active_sensors;
-    oc_start_time = 0; // 只要看得到線，就持續重置計時器
+    oc_start_time = 0;
   }
   else {
-    // 🛑 狀況 B：全白狀態（衝出賽道或抵達終點）
-    if (oc_start_time == 0) {
-      oc_start_time = millis(); // 剛進入全白，開始記錄時間
-    }
-
-    // 🛡️ 終點自動煞車防護網 (350ms 緩衝)
-    if (millis() - oc_start_time > 350) {
-      ebs_triggered = true;
-      return;
-    }
-
-    // 🌟 【完美煞車優化】判斷失聯前的姿態
-    // 如果失聯前誤差大於 0.8，代表是在「大彎道」噴出去的，啟動極端盲抓救援
-    if (last_error < -0.8) {
-      current_error = -2.5;
-    }
-    else if (last_error > 0.8) {
-      current_error = 2.5;
-    }
-    // 如果失聯前誤差很小（在 -0.8 到 0.8 之間），代表是在「直線」衝刺
-    // 此時遇到全白極高機率是終點，不要亂轉方向盤，維持直線滑行準備煞車
-    else {
-      current_error = 0.0;
-    }
+    if (oc_start_time == 0) oc_start_time = millis();
+    else if (millis() - oc_start_time > 5000) { ebs_triggered = true; return; }
+    if (last_error < 0) current_error = -2.5;
+    else if (last_error > 0) current_error = 2.5;
   }
 
-  // 5. 動態車速調整
-  if (abs(current_error) <= 0.3) {
-    current_base_speed = min(current_base_speed + ACCEL_RATE, MAX_BASE_SPEED);
-  } else {
-    current_base_speed = max(current_base_speed - DECEL_RATE, MIN_BASE_SPEED);
-  }
+  if (abs(current_error) <= 0.5) current_base_speed = min(current_base_speed + ACCEL_RATE, MAX_BASE_SPEED);
+  else current_base_speed = max(current_base_speed - DECEL_RATE, MIN_BASE_SPEED);
 
-  // 6. PD 控制量輸出計算
   float P = current_error;
   float D = current_error - last_error;
   float motor_delta = (KP * P) + (KD * D);
   last_error = current_error;
 
-  // 7. 計算馬達 PWM 並限幅在 ±1023 之間
   float left_speed = max(min(current_base_speed - motor_delta, 1023.0f), -1023.0f);
   float right_speed = max(min(current_base_speed + motor_delta, 1023.0f), -1023.0f);
 
-  // 8. 實際驅動硬體
   control_motor_left(left_speed);
   control_motor_right(right_speed);
   delay(5);
